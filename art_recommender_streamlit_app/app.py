@@ -172,9 +172,11 @@ st.markdown(
 # ============================================================
 # 경로 설정
 # ============================================================
-DEFAULT_VISUAL_DB_PATH = "./artwork_db_total.pt"
-DEFAULT_SENTIMENT_DB_PATH = "./artwork_sentiment_db_total.pt"
-DEFAULT_DATASET_ROOT = "./wikiart_images"
+APP_DIR = Path(__file__).resolve().parent
+
+DEFAULT_VISUAL_DB_PATH = str(APP_DIR / "artwork_db_total.pt")
+DEFAULT_SENTIMENT_DB_PATH = str(APP_DIR / "artwork_sentiment_db_total.pt")
+DEFAULT_DATASET_ROOT = str(APP_DIR / "wikiart_images")
 
 # ============================================================
 # 캐시: DB와 모델은 한 번만 로드
