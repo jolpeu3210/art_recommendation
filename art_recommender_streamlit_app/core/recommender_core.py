@@ -22,6 +22,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from torchvision import models, transforms
 from transformers import CLIPProcessor, CLIPModel
+from pathlib import Path
 
 
 # -----------------------------
@@ -289,14 +290,54 @@ def load_and_align_databases(
     sentiment_db_path=SENTIMENT_DB_PATH,
     selected_sentiment_indices=SELECTED_SENTIMENT_INDICES,
 ):
+    """
+    CNN/ViT 시각 DB와 CLIP 감성 DB를 같은 이미지 기준으로 정렬합니다.
+
+    기존 문제:
+    - 두 DB에 같은 이미지가 있어도 path 문자열이 완전히 다르면 공통 이미지로 인식하지 못함.
+    - 예: 
+      visual DB    : C:/Users/.../wikiart_images/genre/image.jpg
+      sentiment DB : wikiart_images/genre/image.jpg
+      또는
+      sentiment DB : genre/image.jpg
+
+    해결 방식:
+    - 여러 기준으로 path key를 만들어보고, 공통 이미지가 가장 많이 잡히는 기준을 자동 선택합니다.
+    - 우선순위:
+      1) wikiart_images 이후 상대경로
+      2) 마지막 2단계 경로, 예: genre/image.jpg
+      3) 파일명만, 예: image.jpg
+    """
+
     visual_db = load_pt(visual_db_path)
     sentiment_db = load_pt(sentiment_db_path)
 
-    visual_paths_key = _get_first_existing_key(visual_db, ["paths", "image_paths", "valid_paths"], "시각 DB paths")
-    sentiment_paths_key = _get_first_existing_key(sentiment_db, ["paths", "image_paths", "valid_paths"], "감성 DB paths")
+    # -----------------------------
+    # 1. DB 내부 키 찾기
+    # -----------------------------
+    visual_paths_key = _get_first_existing_key(
+        visual_db,
+        ["paths", "image_paths", "valid_paths"],
+        "시각 DB paths",
+    )
 
-    cnn_key = _get_first_existing_key(visual_db, ["cnn", "cnn_features", "resnet", "resnet_features"], "CNN 좌표")
-    vit_key = _get_first_existing_key(visual_db, ["vit", "vit_features", "vision_transformer"], "ViT 좌표")
+    sentiment_paths_key = _get_first_existing_key(
+        sentiment_db,
+        ["paths", "image_paths", "valid_paths"],
+        "감성 DB paths",
+    )
+
+    cnn_key = _get_first_existing_key(
+        visual_db,
+        ["cnn", "cnn_features", "resnet", "resnet_features"],
+        "CNN 좌표",
+    )
+
+    vit_key = _get_first_existing_key(
+        visual_db,
+        ["vit", "vit_features", "vision_transformer"],
+        "ViT 좌표",
+    )
 
     if "probs" in sentiment_db:
         sentiment_key = "probs"
@@ -311,35 +352,163 @@ def load_and_align_databases(
             label="감성 좌표",
         )
 
-    visual_paths = visual_db[visual_paths_key]
-    sentiment_paths = sentiment_db[sentiment_paths_key]
+    visual_paths = list(visual_db[visual_paths_key])
+    sentiment_paths = list(sentiment_db[sentiment_paths_key])
 
-    visual_map = {}
-    for i, p in enumerate(visual_paths):
-        visual_map[path_key(p)] = i
+    # -----------------------------
+    # 2. 경로 정규화 함수
+    # -----------------------------
+    def clean_path(p):
+        p = str(p).replace("\\", "/")
+        p = p.strip()
+        return p
 
-    sentiment_map = {}
-    for i, p in enumerate(sentiment_paths):
-        sentiment_map[path_key(p)] = i
+    def key_after_wikiart_root(p):
+        """
+        wikiart_images 이후의 상대경로를 key로 사용합니다.
+        예:
+        C:/.../wikiart_images/Impressionism/a.jpg
+        -> impressionism/a.jpg
+        """
+        p = clean_path(p)
+        parts = [x for x in p.split("/") if x]
 
-    common_keys = sorted(set(visual_map.keys()) & set(sentiment_map.keys()))
+        lowered = [x.lower() for x in parts]
+
+        if "wikiart_images" in lowered:
+            idx = lowered.index("wikiart_images")
+            rest = parts[idx + 1:]
+            if rest:
+                return "/".join(rest).lower()
+
+        return None
+
+    def key_last_two_parts(p):
+        """
+        마지막 폴더명 + 파일명을 key로 사용합니다.
+        예:
+        Impressionism/a.jpg
+        -> impressionism/a.jpg
+        """
+        p = clean_path(p)
+        parts = [x for x in p.split("/") if x]
+
+        if len(parts) >= 2:
+            return "/".join(parts[-2:]).lower()
+
+        return None
+
+    def key_filename_only(p):
+        """
+        파일명만 key로 사용합니다.
+        예:
+        a.jpg
+        -> a.jpg
+        """
+        p = clean_path(p)
+        name = os.path.basename(p)
+        if name:
+            return name.lower()
+
+        return None
+
+    key_strategies = [
+        ("wikiart_root_relative", key_after_wikiart_root),
+        ("last_two_parts", key_last_two_parts),
+        ("filename_only", key_filename_only),
+    ]
+
+    def build_unique_map(paths, key_func):
+        """
+        key -> index map을 만듭니다.
+        같은 key가 여러 번 나오면 중복 위험이 있으므로 일단 제외합니다.
+        """
+        temp = {}
+
+        for i, p in enumerate(paths):
+            k = key_func(p)
+            if k is None or k == "":
+                continue
+
+            if k not in temp:
+                temp[k] = []
+            temp[k].append(i)
+
+        unique_map = {
+            k: idxs[0]
+            for k, idxs in temp.items()
+            if len(idxs) == 1
+        }
+
+        duplicate_count = sum(1 for idxs in temp.values() if len(idxs) > 1)
+
+        return unique_map, duplicate_count
+
+    # -----------------------------
+    # 3. 가장 많이 겹치는 매칭 기준 자동 선택
+    # -----------------------------
+    best = None
+
+    for strategy_name, key_func in key_strategies:
+        visual_map, visual_dup_count = build_unique_map(visual_paths, key_func)
+        sentiment_map, sentiment_dup_count = build_unique_map(sentiment_paths, key_func)
+
+        common_keys = sorted(set(visual_map.keys()) & set(sentiment_map.keys()))
+
+        candidate = {
+            "strategy_name": strategy_name,
+            "key_func": key_func,
+            "visual_map": visual_map,
+            "sentiment_map": sentiment_map,
+            "common_keys": common_keys,
+            "visual_dup_count": visual_dup_count,
+            "sentiment_dup_count": sentiment_dup_count,
+        }
+
+        if best is None or len(common_keys) > len(best["common_keys"]):
+            best = candidate
+
+    common_keys = best["common_keys"]
+
+    # -----------------------------
+    # 4. 공통 이미지가 없을 때 디버깅 정보 출력
+    # -----------------------------
     if not common_keys:
+        visual_sample = [str(p) for p in visual_paths[:10]]
+        sentiment_sample = [str(p) for p in sentiment_paths[:10]]
+
         raise ValueError(
-            "두 DB에서 공통 이미지 경로를 찾지 못했습니다. "
-            "두 좌표 파일이 같은 이미지 폴더에서 만들어졌는지 확인하세요."
+            "두 DB에서 공통 이미지 경로를 찾지 못했습니다.\n\n"
+            "가능한 원인:\n"
+            "1) 두 DB가 서로 다른 이미지 목록으로 만들어졌습니다.\n"
+            "2) 한쪽 DB에는 확장자 또는 파일명이 다르게 저장되어 있습니다.\n"
+            "3) path가 아니라 다른 식별자 기준으로 저장되어 있을 수 있습니다.\n\n"
+            f"[시각 DB path 샘플]\n{visual_sample}\n\n"
+            f"[감성 DB path 샘플]\n{sentiment_sample}\n"
         )
 
-    visual_indices = [visual_map[k] for k in common_keys]
-    sentiment_indices = [sentiment_map[k] for k in common_keys]
+    visual_indices = [best["visual_map"][k] for k in common_keys]
+    sentiment_indices = [best["sentiment_map"][k] for k in common_keys]
+
+    # -----------------------------
+    # 5. 텐서 정렬
+    # -----------------------------
+    visual_cnn = visual_db[cnn_key][visual_indices].float()
+    visual_vit = visual_db[vit_key][visual_indices].float()
 
     sentiment_all = sentiment_db[sentiment_key][sentiment_indices].float()
-    sentiment_selected = select_sentiment_dimensions(sentiment_all, selected_sentiment_indices)
+    sentiment_selected = select_sentiment_dimensions(
+        sentiment_all,
+        selected_sentiment_indices,
+    )
+
+    aligned_paths = [visual_paths[i] for i in visual_indices]
 
     aligned_db = {
-        "cnn": visual_db[cnn_key][visual_indices].float(),
-        "vit": visual_db[vit_key][visual_indices].float(),
+        "cnn": visual_cnn,
+        "vit": visual_vit,
         "sentiment": sentiment_selected,
-        "paths": [visual_paths[i] for i in visual_indices],
+        "paths": aligned_paths,
         "keys": common_keys,
         "used_sentiment_queries": USED_SENTIMENT_QUERIES,
         "selected_sentiment_indices": selected_sentiment_indices,
@@ -350,12 +519,23 @@ def load_and_align_databases(
             "vit": vit_key,
             "sentiment": sentiment_key,
         },
+        "matching_info": {
+            "strategy": best["strategy_name"],
+            "visual_duplicate_keys": best["visual_dup_count"],
+            "sentiment_duplicate_keys": best["sentiment_dup_count"],
+        },
     }
 
+    # -----------------------------
+    # 6. 결과 확인 출력
+    # -----------------------------
     print("✅ DB 로드 및 정렬 완료")
     print(f" - CNN/ViT DB 이미지 수: {len(visual_paths):,}")
     print(f" - CLIP 감성 DB 이미지 수: {len(sentiment_paths):,}")
     print(f" - 최종 공통 이미지 수: {len(aligned_db['paths']):,}")
+    print(f" - 사용한 매칭 기준: {best['strategy_name']}")
+    print(f" - 시각 DB 중복 key 수: {best['visual_dup_count']:,}")
+    print(f" - 감성 DB 중복 key 수: {best['sentiment_dup_count']:,}")
     print(f" - 사용한 DB 키: {aligned_db['source_keys']}")
     print(f" - CNN shape: {tuple(aligned_db['cnn'].shape)}")
     print(f" - ViT shape: {tuple(aligned_db['vit'].shape)}")
